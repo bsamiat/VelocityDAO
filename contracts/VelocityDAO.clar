@@ -200,3 +200,110 @@
     (ok true)
   )
 )
+
+;; Pauses contract operations
+(define-public (pause-contract)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (var-set contract-paused true)
+    (ok true)
+  )
+)
+
+;; Resumes contract operations
+(define-public (resume-contract)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (var-set contract-paused false)
+    (ok true)
+  )
+)
+
+;; PUBLIC FUNCTIONS - STAKING OPERATIONS
+
+;; Stakes STX tokens with optional lock period
+(define-public (stake-stx
+    (amount uint)
+    (lock-period uint)
+  )
+  (let ((current-position (default-to {
+      total-collateral: u0,
+      total-debt: u0,
+      health-factor: u0,
+      last-updated: u0,
+      stx-staked: u0,
+      analytics-tokens: u0,
+      voting-power: u0,
+      tier-level: u0,
+      rewards-multiplier: u100,
+    }
+      (map-get? UserPositions tx-sender)
+    )))
+    (asserts! (is-valid-lock-period lock-period) ERR-INVALID-PROTOCOL)
+    (asserts! (not (var-get contract-paused)) ERR-PAUSED)
+    (asserts! (>= amount (var-get minimum-stake)) ERR-BELOW-MINIMUM)
+    ;; Transfer STX to contract
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    ;; Calculate tier level and multiplier
+    (let (
+        (new-total-stake (+ (get stx-staked current-position) amount))
+        (tier-info (get-tier-info new-total-stake))
+        (lock-multiplier (calculate-lock-multiplier lock-period))
+      )
+      ;; Update staking position
+      (map-set StakingPositions tx-sender {
+        amount: amount,
+        start-block: stacks-block-height,
+        last-claim: stacks-block-height,
+        lock-period: lock-period,
+        cooldown-start: none,
+        accumulated-rewards: u0,
+      })
+      ;; Update user position with new tier info
+      (map-set UserPositions tx-sender
+        (merge current-position {
+          stx-staked: new-total-stake,
+          tier-level: (get tier-level tier-info),
+          rewards-multiplier: (* (get reward-multiplier tier-info) lock-multiplier),
+        })
+      )
+      ;; Update STX pool
+      (var-set stx-pool (+ (var-get stx-pool) amount))
+      (ok true)
+    )
+  )
+)
+
+;; Initiates unstaking process with cooldown period
+(define-public (initiate-unstake (amount uint))
+  (let (
+      (staking-position (unwrap! (map-get? StakingPositions tx-sender) ERR-NO-STAKE))
+      (current-amount (get amount staking-position))
+    )
+    (asserts! (>= current-amount amount) ERR-INSUFFICIENT-STX)
+    (asserts! (is-none (get cooldown-start staking-position)) ERR-COOLDOWN-ACTIVE)
+    ;; Update staking position with cooldown
+    (map-set StakingPositions tx-sender
+      (merge staking-position { cooldown-start: (some stacks-block-height) })
+    )
+    (ok true)
+  )
+)
+
+;; Completes unstaking after cooldown period
+(define-public (complete-unstake)
+  (let (
+      (staking-position (unwrap! (map-get? StakingPositions tx-sender) ERR-NO-STAKE))
+      (cooldown-start (unwrap! (get cooldown-start staking-position) ERR-NOT-AUTHORIZED))
+    )
+    (asserts!
+      (>= (- stacks-block-height cooldown-start) (var-get cooldown-period))
+      ERR-COOLDOWN-ACTIVE
+    )
+    ;; Transfer STX back to user
+    (try! (as-contract (stx-transfer? (get amount staking-position) tx-sender tx-sender)))
+    ;; Clear staking position
+    (map-delete StakingPositions tx-sender)
+    (ok true)
+  )
+)
